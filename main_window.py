@@ -14,27 +14,24 @@ from PySide6.QtWidgets import (
 from widgets import ClickableLabel
 
 class PDFEditor(QMainWindow):
-    SELECTION_TOLERANCE = 15
+    SELECTION_TOLERANCE = 10
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF Editor")
-        self.setGeometry(100, 100, 800, 600)
+        self.setFixedSize(1200, 900)
 
         self.doc = None
-        self.current_page_num = 0
+        self.current_page = None
         self.current_pixmap = None
-        self.scale_factor = 1.0
         self.spans = []
-        
-        # NEW: We now track two states: hovered and selected
         self.hovered_span = None
         self.selected_span = None
 
         self.image_label = ClickableLabel("Open a PDF file to begin.")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.clicked.connect(self.on_page_clicked)
-        self.image_label.hovered.connect(self.on_page_hovered) # NEW: Connect hover signal
+        self.image_label.hovered.connect(self.on_page_hovered)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -43,7 +40,7 @@ class PDFEditor(QMainWindow):
         self._create_menu_bar()
 
     def _create_menu_bar(self):
-        # ... (This method remains unchanged)
+        # ... (unchanged)
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
         open_action = QAction("&Open", self)
@@ -54,13 +51,13 @@ class PDFEditor(QMainWindow):
         file_menu.addAction(exit_action)
 
     def _distance_point_to_rect(self, point, rect):
-        # ... (This method remains unchanged)
+        # ... (unchanged)
         closest_x = max(rect.x0, min(point.x, rect.x1))
         closest_y = max(rect.y0, min(point.y, rect.y1))
         return math.sqrt((point.x - closest_x)**2 + (point.y - closest_y)**2)
 
     def open_pdf(self):
-        # ... (This method remains unchanged)
+        # ... (unchanged)
         filepath, _ = QFileDialog.getOpenFileName(self, "Open PDF File", "", "PDF Files (*.pdf)")
         if filepath:
             try:
@@ -71,44 +68,65 @@ class PDFEditor(QMainWindow):
                 self.image_label.setText("Failed to load PDF.")
 
     def display_page(self, page_number):
-        # ... (This method is mostly unchanged, just clears new states)
         if not self.doc or not (0 <= page_number < self.doc.page_count):
             return
-        self.current_page_num = page_number
+        
+        self.current_page = self.doc.load_page(page_number)
         self.selected_span = None
         self.hovered_span = None
         self.spans = []
-        page = self.doc.load_page(self.current_page_num)
-        page_dict = page.get_text("dict")
+        page_dict = self.current_page.get_text("dict")
+        
         for block in page_dict.get("blocks", []):
             if block["type"] == 0:
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
-                        span_info = {
-                            "text": span["text"], "font": span["font"],
-                            "size": span["size"], "color": span["color"],
-                            "rect": fitz.Rect(span["bbox"])
-                        }
-                        self.spans.append(span_info)
-        pix = page.get_pixmap()
-        self.current_pixmap = QPixmap.fromImage(
-            QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-        )
-        self.scale_factor = self.current_pixmap.width() / page.rect.width
+                        self.spans.append({"text": span["text"], "font": span["font"], "size": span["size"], "color": span["color"], "rect": fitz.Rect(span["bbox"])})
+                        
+        pix = self.current_page.get_pixmap(dpi=150)
+        self.current_pixmap = QPixmap.fromImage(QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888))
         self.image_label.setPixmap(self.current_pixmap)
-    
-    # NEW: This method handles the logic for finding the span under the cursor
-    def _find_span_at_position(self, position):
-        if not self.doc or not self.spans:
+        self.highlight_selection() # Initial draw with no selection
+
+    # --- REBUILT FROM SCRATCH: The correct mapping logic ---
+    def _map_widget_to_pdf_coords(self, widget_pos):
+        if self.current_pixmap is None or self.current_page is None:
             return None
-        pdf_point = fitz.Point(position.x() / self.scale_factor, position.y() / self.scale_factor)
+
+        # Calculate the geometry of the displayed image (with letterboxing)
+        label_size = self.image_label.size()
+        pixmap_size = self.image_label.pixmap().size()
+        scaled_pixmap_size = pixmap_size.scaled(label_size, Qt.KeepAspectRatio)
+        offset_x = (label_size.width() - scaled_pixmap_size.width()) / 2
+        offset_y = (label_size.height() - scaled_pixmap_size.height()) / 2
+
+        # Convert widget coordinates to coordinates on the scaled pixmap
+        pixmap_x = widget_pos.x() - offset_x
+        pixmap_y = widget_pos.y() - offset_y
+
+        # Check if click was in the letterbox area
+        if not (0 <= pixmap_x <= scaled_pixmap_size.width() and 0 <= pixmap_y <= scaled_pixmap_size.height()):
+            return None
+
+        # Convert from scaled pixmap coordinates to PDF page coordinates using a direct ratio
+        pdf_page_width = self.current_page.rect.width
+        pdf_page_height = self.current_page.rect.height
         
-        # First check for a direct hit
+        pdf_x = (pixmap_x / scaled_pixmap_size.width()) * pdf_page_width
+        pdf_y = (pixmap_y / scaled_pixmap_size.height()) * pdf_page_height
+
+        return fitz.Point(pdf_x, pdf_y)
+
+
+    def _find_span_at_position(self, position):
+        # This function is now correct because its input is correct
+        pdf_point = self._map_widget_to_pdf_coords(position)
+        if pdf_point is None:
+            return None
+        
         for span in self.spans:
-            if span["rect"].contains(pdf_point):
-                return span
+            if span["rect"].contains(pdf_point): return span
         
-        # If no direct hit, check for a near miss
         closest_span = None
         min_dist = float('inf')
         for span in self.spans:
@@ -118,50 +136,53 @@ class PDFEditor(QMainWindow):
                 closest_span = span
         if min_dist < self.SELECTION_TOLERANCE:
             return closest_span
-        
         return None
 
-    # NEW: Handles the hover event
     def on_page_hovered(self, position):
+        # ... (unchanged)
         span_under_cursor = self._find_span_at_position(position)
-        # Only update if the hovered span has changed to avoid constant redrawing
         if self.hovered_span != span_under_cursor:
             self.hovered_span = span_under_cursor
             self.highlight_selection()
 
-    # MODIFIED: The click handler is now much simpler
     def on_page_clicked(self, position):
-        # The hovered span becomes the selected span
+        # ... (unchanged)
         self.selected_span = self.hovered_span
         self.highlight_selection()
 
-    # MODIFIED: Now draws two different highlights
+    # --- REBUILT FROM SCRATCH: The correct drawing logic ---
     def highlight_selection(self):
         if self.current_pixmap is None:
+            self.image_label.setPixmap(QPixmap()) # Clear the label if no pixmap
             return
         
         temp_pixmap = self.current_pixmap.copy()
         painter = QPainter(temp_pixmap)
 
-        # Draw hover highlight (subtle grey)
-        if self.hovered_span:
-            span_rect = self.hovered_span["rect"]
-            highlight_rect = QRectF(
-                span_rect.x0 * self.scale_factor, span_rect.y0 * self.scale_factor,
-                span_rect.width * self.scale_factor, span_rect.height * self.scale_factor
-            )
-            hover_color = QColor(150, 150, 150, 80) # Light grey, semi-transparent
-            painter.fillRect(highlight_rect, hover_color)
+        # Recalculate geometry for drawing (essential for correctness)
+        label_size = self.image_label.size()
+        pixmap_size = self.image_label.pixmap().size()
+        scaled_pixmap_size = pixmap_size.scaled(label_size, Qt.KeepAspectRatio)
+        offset_x = (label_size.width() - scaled_pixmap_size.width()) / 2
+        offset_y = (label_size.height() - scaled_pixmap_size.height()) / 2
+        pdf_page_width = self.current_page.rect.width
+        pdf_page_height = self.current_page.rect.height
 
-        # Draw selection highlight (prominent blue) on top
+        # Function to convert a PDF rect to a drawable Qt rect
+        def pdf_to_widget_rect(pdf_rect):
+            x = (pdf_rect.x0 / pdf_page_width) * scaled_pixmap_size.width() + offset_x
+            y = (pdf_rect.y0 / pdf_page_height) * scaled_pixmap_size.height() + offset_y
+            width = (pdf_rect.width / pdf_page_width) * scaled_pixmap_size.width()
+            height = (pdf_rect.height / pdf_page_height) * scaled_pixmap_size.height()
+            return QRectF(x, y, width, height)
+
+        # Draw hover highlight
+        if self.hovered_span:
+            painter.fillRect(pdf_to_widget_rect(self.hovered_span["rect"]), QColor(150, 150, 150, 80))
+
+        # Draw selection highlight
         if self.selected_span:
-            span_rect = self.selected_span["rect"]
-            highlight_rect = QRectF(
-                span_rect.x0 * self.scale_factor, span_rect.y0 * self.scale_factor,
-                span_rect.width * self.scale_factor, span_rect.height * self.scale_factor
-            )
-            select_color = QColor(0, 120, 215, 100) # Blue, semi-transparent
-            painter.fillRect(highlight_rect, select_color)
+            painter.fillRect(pdf_to_widget_rect(self.selected_span["rect"]), QColor(0, 120, 215, 100))
 
         painter.end()
         self.image_label.setPixmap(temp_pixmap)
